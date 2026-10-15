@@ -37,3 +37,16 @@ Audio starts from the Start button gesture. Safari can still suspend a PWA or si
 ## Validation
 
 `npm run check` and `npm run build` pass. A production Chromium smoke run verified duration editing, preset saving, starting, pausing/resuming, timed phase transition, skipping, stopping and service-worker offline reload with no browser runtime errors. Responsive layouts were checked at 390px and 1440px. Actual iOS hardware behavior remains unverified.
+
+## GitHub Pages
+
+In repository **Settings → Pages → Build and deployment**, select **GitHub Actions** as the source. The `Deploy timer to GitHub Pages` workflow builds and deploys every push to `main`; it can also be run manually from the Actions tab. After a successful deployment the site is at https://xintiangao.github.io/tempo/.
+
+The workflow builds with `BASE_PATH=/tempo` so service-worker scope, audio, icons and the app manifest work under the repository URL. To validate this deployment locally:
+
+```sh
+BASE_PATH=/tempo npm run build
+npm run preview
+```
+
+For a root-domain deployment, omit `BASE_PATH`.
