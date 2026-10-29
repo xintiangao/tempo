@@ -50,3 +50,11 @@ npm run preview
 ```
 
 For a root-domain deployment, omit `BASE_PATH`.
+
+## Workout reload recovery and iOS audio
+
+Active workouts are checkpointed locally before audio cues and whenever they are paused, resumed or skipped. After a page reload, an unfinished workout is restored paused at its current phase and remaining time, accounting for time elapsed while running. Tap Play to continue. Stopping or completing clears the checkpoint. Recovery needs browser storage to be available; it does not sync across devices.
+
+On iPhone/iPad, spoken announcements default to off each time the page loads, and the silent HTML audio loop is disabled to avoid overlapping audio playback paths. Beep cues remain enabled. Speech can be explicitly enabled in Audio settings, but device testing is needed: browser speech errors are handled, while an operating-system browser-process crash cannot be caught in JavaScript. Keeping the screen visible is still recommended.
+
+Run `npm test` for recovery tests. Chromium regression checks also covered reloading after the 30-second cue, paused recovery/resume, skipping, stopping, iOS safety defaults (emulated user agent), and simulated speech API exceptions. These checks do not reproduce or establish a fix for a physical iPhone Safari crash.

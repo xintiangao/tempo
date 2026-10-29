@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { base } from '$app/paths';
+  import { SESSION_KEY, recoverSession } from '$lib/recovery';
   function focusDialog(node) { const previous=document.activeElement; node.focus(); const key=(e)=>{if(e.key==='Escape'){modal='';return;}if(e.key==='Tab'){const all=[...node.querySelectorAll('button:not(:disabled),input,textarea')];const first=all[0],last=all[all.length-1];if(e.shiftKey&&(document.activeElement===first||document.activeElement===node)){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}};node.addEventListener('keydown',key);return{destroy(){node.removeEventListener('keydown',key);previous?.focus();}}; }
   let rounds = $state(5), work = $state(90), rest = $state(150), sets = $state(1), setRest = $state(60);
   let useSets = $state(false), notesOpen = $state(false), notes = $state('');
@@ -8,6 +9,7 @@
   let modal = $state(''), edit = $state(''), minutes = $state(0), seconds = $state(0), count = $state(5);
   let active = $state(false), paused = $state(false), done = $state(false), remaining = $state(90), phaseIndex = $state(0), phases = $state([]);
   let presets = $state([]), presetName = $state(''), toast = $state('');
+  let ios = $state(false);
   let deadline = 0, interval, audio, context, lock, lastSecond = -1;
   const fmt = n => `${Math.floor(Math.max(0,n)/60).toString().padStart(2,'0')}:${Math.floor(Math.max(0,n)%60).toString().padStart(2,'0')}`;
   let total = $derived((work * rounds + rest * Math.max(0, rounds - 1)) * (useSets ? sets : 1) + (useSets ? setRest * (sets - 1) : 0));
@@ -15,22 +17,52 @@
   let progress = $derived(phase ? (1 - remaining / phase.duration) * 100 : 0);
   function notify(message) { toast = message; setTimeout(() => toast = '', 3000); }
   function config() { return { rounds, work, rest, sets, setRest, useSets, notes, cues, countdown, sound, voice }; }
-  function persist() { localStorage.setItem('tempo-config', JSON.stringify(config())); }
+  function persist() { try { localStorage.setItem('tempo-config', JSON.stringify(config())); } catch {} }
+  function saveSession() {
+    if (!active) return;
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify({ version: 1, config: config(), phases, phaseIndex, deadline, remaining, paused })); } catch {}
+  }
+  function clearSession() { try { localStorage.removeItem(SESSION_KEY); } catch {} }
+  function restoreSession() {
+    try {
+      const saved = recoverSession(JSON.parse(localStorage.getItem(SESSION_KEY)));
+      if (!saved || saved.complete) { clearSession(); return; }
+      apply(saved.config); if (ios) voice = false;
+      phases = saved.phases; phaseIndex = saved.phaseIndex; remaining = saved.remaining;
+      // Resume only from a user gesture: never automatically retry audio after a reload.
+      paused = true; active = true; deadline = saved.deadline; lastSecond = Math.ceil(remaining);
+      saveSession(); notify('Workout recovered. Tap play to continue.');
+    } catch { clearSession(); }
+  }
+  function cancelSpeech() { try { window.speechSynthesis?.cancel(); } catch {} }
+  function playKeepAlive() { if (!ios) { try { audio?.play()?.catch(() => {}); } catch {} } }
+
   function apply(c) { rounds=c.rounds;work=c.work;rest=c.rest;sets=c.sets;setRest=c.setRest;useSets=c.useSets;notes=c.notes || '';cues=c.cues || [30,15];countdown=c.countdown ?? true;sound=c.sound ?? true;voice=c.voice ?? true; }
   function openEditor(key) { edit=key; const n={rounds,work,rest,sets,setRest}[key];minutes=Math.floor(n/60);seconds=n%60;count=n;modal='edit'; }
   function saveEdit() { const n=['rounds','sets'].includes(edit) ? Math.min(99,Math.max(1,Number(count)||1)) : Math.min(5999,Math.max(edit==='work'?1:0,(Number(minutes)||0)*60+(Number(seconds)||0))); if(edit==='rounds')rounds=n;if(edit==='work')work=n;if(edit==='rest')rest=n;if(edit==='sets')sets=n;if(edit==='setRest')setRest=n;modal='';persist(); }
   function beep(freq=660) { if(!sound)return;try { context ||= new (window.AudioContext || window.webkitAudioContext)();context.resume();const o=context.createOscillator(),g=context.createGain();o.connect(g);g.connect(context.destination);o.frequency.value=freq;g.gain.setValueAtTime(.13,context.currentTime);g.gain.exponentialRampToValueAtTime(.001,context.currentTime+.16);o.start();o.stop(context.currentTime+.17); }catch{} }
-  function announce(text) { if(!sound)return;if(voice && 'speechSynthesis' in window){speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.rate=1;u.onerror=()=>beep();speechSynthesis.speak(u);}else beep(); }
+  function announce(text) {
+    if (!sound) return;
+    if (!voice || !('speechSynthesis' in window)) { beep(); return; }
+    try {
+      // Avoid cancelling an utterance and immediately starting another on Safari.
+      if (speechSynthesis.speaking || speechSynthesis.pending) { beep(); return; }
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1;
+      utterance.onerror = () => beep();
+      speechSynthesis.speak(utterance);
+    } catch { beep(); }
+  }
   async function wake() { try { if('wakeLock' in navigator && !paused && active) lock=await navigator.wakeLock.request('screen'); }catch{} }
-  function metadata() { if('mediaSession' in navigator){ navigator.mediaSession.metadata=new MediaMetadata({title:`${phase?.name || 'Complete'} — ${fmt(remaining)}`,artist:'Workout Interval Timer',album:`Round ${phase?.round || rounds} of ${rounds}`,artwork:[{src:`${base}/icon-512.png`,sizes:'512x512',type:'image/png'}]});navigator.mediaSession.playbackState=paused?'paused':'playing'; } }
-  function start() { persist();phases=[];for(let s=1;s<=(useSets?sets:1);s++){for(let r=1;r<=rounds;r++){phases.push({name:'Work',duration:work,round:r,set:s});if(r<rounds && rest>0)phases.push({name:'Rest',duration:rest,round:r,set:s});}if(s<(useSets?sets:1)&&setRest>0)phases.push({name:'Set rest',duration:setRest,round:rounds,set:s});}phaseIndex=0;remaining=phases[0].duration;active=true;paused=false;done=false;deadline=Date.now()+remaining*1000;lastSecond=remaining;audio.play().catch(()=>{});beep();announce('Work');wake();metadata(); }
-  function finish() { active=false;done=true;audio?.pause();lock?.release();if('speechSynthesis' in window)speechSynthesis.cancel();announce('Workout complete. Well done.');if('mediaSession' in navigator)navigator.mediaSession.playbackState='none'; }
-  function tick() { if(!active||paused)return;const now=Date.now();let changed=false;while(now>=deadline){if(phaseIndex>=phases.length-1){finish();return;}phaseIndex++;deadline+=phases[phaseIndex].duration*1000;changed=true;}remaining=Math.ceil((deadline-now)/1000);if(changed)announce(phase.name);if(lastSecond!==remaining){if(!changed && cues.includes(remaining) && remaining<phase.duration)announce(`${remaining===60?'1 minute':remaining+' seconds'} left`);if(countdown&&remaining>0&&remaining<=3)beep(remaining===1?880:660);lastSecond=remaining;metadata();} }
-  function pauseResume() { if(!active)return;if(!paused){tick();if(!active)return;remaining=Math.max(0,(deadline-Date.now())/1000);paused=true;audio.pause();lock?.release();if('speechSynthesis' in window)speechSynthesis.cancel();}else{deadline=Date.now()+remaining*1000;paused=false;audio.play().catch(()=>{});wake();}metadata(); }
-  function skip() { if(phaseIndex>=phases.length-1){finish();return;}phaseIndex++;remaining=phase.duration;deadline=Date.now()+remaining*1000;lastSecond=remaining;announce(phase.name);metadata(); }
-  function stop() {active=false;done=false;modal='';audio?.pause();lock?.release();if('speechSynthesis' in window)speechSynthesis.cancel();if('mediaSession' in navigator)navigator.mediaSession.playbackState='none';}
+  function metadata() { try { if('mediaSession' in navigator && 'MediaMetadata' in window){ navigator.mediaSession.metadata=new MediaMetadata({title:`${phase?.name || 'Complete'} — ${fmt(remaining)}`,artist:'Workout Interval Timer',album:`Round ${phase?.round || rounds} of ${rounds}`,artwork:[{src:`${base}/icon-512.png`,sizes:'512x512',type:'image/png'}]});navigator.mediaSession.playbackState=paused?'paused':'playing'; } } catch {} }
+  function start() { persist();phases=[];for(let s=1;s<=(useSets?sets:1);s++){for(let r=1;r<=rounds;r++){phases.push({name:'Work',duration:work,round:r,set:s});if(r<rounds && rest>0)phases.push({name:'Rest',duration:rest,round:r,set:s});}if(s<(useSets?sets:1)&&setRest>0)phases.push({name:'Set rest',duration:setRest,round:rounds,set:s});}phaseIndex=0;remaining=phases[0].duration;active=true;paused=false;done=false;deadline=Date.now()+remaining*1000;lastSecond=remaining;saveSession();playKeepAlive();beep();announce('Work');wake();metadata(); }
+  function finish() { clearSession();active=false;done=true;audio?.pause();lock?.release();cancelSpeech();announce('Workout complete. Well done.');if('mediaSession' in navigator)navigator.mediaSession.playbackState='none'; }
+  function tick() { if(!active||paused)return;const now=Date.now();let changed=false;while(now>=deadline){if(phaseIndex>=phases.length-1){finish();return;}phaseIndex++;deadline+=phases[phaseIndex].duration*1000;changed=true;}remaining=Math.ceil((deadline-now)/1000);if(changed||lastSecond!==remaining)saveSession();if(changed)announce(phase.name);if(lastSecond!==remaining){if(!changed && cues.includes(remaining) && remaining<phase.duration)announce(`${remaining===60?'1 minute':remaining+' seconds'} left`);if(countdown&&remaining>0&&remaining<=3)beep(remaining===1?880:660);lastSecond=remaining;metadata();} }
+  function pauseResume() { if(!active)return;if(!paused){tick();if(!active)return;remaining=Math.max(0,(deadline-Date.now())/1000);paused=true;audio.pause();lock?.release();cancelSpeech();}else{deadline=Date.now()+remaining*1000;paused=false;playKeepAlive();wake();}saveSession();metadata(); }
+  function skip() { if(phaseIndex>=phases.length-1){finish();return;}phaseIndex++;remaining=phase.duration;deadline=Date.now()+remaining*1000;lastSecond=remaining;saveSession();announce(phase.name);metadata(); }
+  function stop() {clearSession();active=false;done=false;modal='';audio?.pause();lock?.release();cancelSpeech();if('mediaSession' in navigator)navigator.mediaSession.playbackState='none';}
   function savePreset() { if(!presetName.trim())return;presets=[...presets,{name:presetName.trim(),config:config()}];localStorage.setItem('tempo-presets',JSON.stringify(presets));presetName='';notify('Workout saved'); }
-  onMount(()=>{ try {const c=JSON.parse(localStorage.getItem('tempo-config'));if(c)apply(c);presets=JSON.parse(localStorage.getItem('tempo-presets'))||[];}catch{}audio=new Audio(`${base}/silence.wav`);audio.loop=true;audio.preload='auto';interval=setInterval(tick,100);const visibility=()=>{if(!document.hidden){tick();wake();}};document.addEventListener('visibilitychange',visibility);if('mediaSession' in navigator)for(const [action,fn] of Object.entries({play:()=>{if(paused)pauseResume();},pause:()=>{if(!paused)pauseResume();},nexttrack:skip,stop})){try{navigator.mediaSession.setActionHandler(action,fn);}catch{}}return()=>{clearInterval(interval);audio?.pause();lock?.release();document.removeEventListener('visibilitychange',visibility);}; });
+  onMount(()=>{ ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); try {const c=JSON.parse(localStorage.getItem('tempo-config'));if(c)apply(c);presets=JSON.parse(localStorage.getItem('tempo-presets'))||[];}catch{}if(ios)voice=false;restoreSession();audio=new Audio(`${base}/silence.wav`);audio.loop=true;audio.preload='auto';interval=setInterval(tick,100);const visibility=()=>{if(!document.hidden){tick();wake();}else saveSession();};const leaving=()=>saveSession();window.addEventListener('pagehide',leaving);document.addEventListener('visibilitychange',visibility);if('mediaSession' in navigator)for(const [action,fn] of Object.entries({play:()=>{if(paused)pauseResume();},pause:()=>{if(!paused)pauseResume();},nexttrack:skip,stop})){try{navigator.mediaSession.setActionHandler(action,fn);}catch{}}return()=>{clearInterval(interval);audio?.pause();lock?.release();document.removeEventListener('visibilitychange',visibility);window.removeEventListener('pagehide',leaving);}; });
 </script>
 
 <svelte:head><title>Workout Interval Timer — Find your rhythm</title><meta name="description" content="A beautifully simple, offline workout interval timer. Set your pace, find your rhythm, and make every round count."/></svelte:head>
@@ -67,7 +99,7 @@
 {#if modal}
 <div class="modal-backdrop" role="presentation" onclick={(e)=>{if(e.target===e.currentTarget)modal='';}}><div use:focusDialog class="modal" role="dialog" aria-modal="true" aria-label={modal==='edit'?`Set ${edit}`:modal==='presets'?'Saved workouts':modal==='stop'?'Stop workout':'Audio settings'} tabindex="-1"><div class="drawer-handle"></div><button class="modal-close icon-button" aria-label="Close dialog" onclick={()=>modal=''}>{@render icon('close')}</button>
 {#if modal==='edit'}<div class="eyebrow">FIND YOUR PACE</div><h2>{ {rounds:'Rounds',work:'Work duration',rest:'Rest duration',sets:'Sets',setRest:'Rest between sets'}[edit]}</h2>{#if ['rounds','sets'].includes(edit)}<div class="stepper"><button aria-label="Decrease" onclick={()=>count=Math.max(1,count-1)}>−</button><input type="number" min="1" max="99" bind:value={count} aria-label="Count"/><button aria-label="Increase" onclick={()=>count=Math.min(99,count+1)}>+</button></div>{:else}<div class="time-inputs"><label><input type="number" min="0" max="99" bind:value={minutes}/>MINUTES</label><span>:</span><label><input type="number" min="0" max="59" bind:value={seconds}/>SECONDS</label></div>{/if}<button class="modal-primary" onclick={saveEdit}>Save changes {@render icon('check',18)}</button>
-{:else if modal==='audio'}<div class="eyebrow">STAY IN THE FLOW</div><h2>Sound & voice</h2><p>A gentle nudge when it's time to move.</p>{#each [{key:'sound',name:'Audio cues',value:sound},{key:'voice',name:'Spoken announcements',value:voice}] as setting}<div class="settings-row"><span>{setting.name}</span><button class="switch" class:on={setting.value} role="switch" aria-checked={setting.value} aria-label={setting.name} onclick={()=>{if(setting.key==='sound')sound=!sound;else voice=!voice;persist();}}><span></span></button></div>{/each}<button class="modal-primary" onclick={()=>announce('Find your rhythm. 30 seconds left.')}>Test audio {@render icon('sound',18)}</button><p class="modal-footnote">On iOS, start your workout with a tap to enable audio. Lock-screen playback depends on your device and Safari version.</p>
+{:else if modal==='audio'}<div class="eyebrow">STAY IN THE FLOW</div><h2>Sound & voice</h2><p>A gentle nudge when it's time to move.</p>{#if ios}<p>For iPhone and iPad stability, spoken announcements start off. Beep cues remain available. Enable speech only if it works reliably on your device.</p>{/if}{#each [{key:'sound',name:'Audio cues',value:sound},{key:'voice',name:'Spoken announcements',value:voice}] as setting}<div class="settings-row"><span>{setting.name}</span><button class="switch" class:on={setting.value} role="switch" aria-checked={setting.value} aria-label={setting.name} onclick={()=>{if(setting.key==='sound')sound=!sound;else voice=!voice;persist();}}><span></span></button></div>{/each}<button class="modal-primary" onclick={()=>announce('Find your rhythm. 30 seconds left.')}>Test audio {@render icon('sound',18)}</button><p class="modal-footnote">On iOS, start your workout with a tap to enable audio. Lock-screen playback depends on your device and Safari version.</p>
 {:else if modal==='presets'}<div class="eyebrow">YOUR GO-TO WORKOUTS</div><h2>Saved rhythms</h2>{#if !presets.length}<p>No saved workouts yet. Save your current setup for next time.</p>{/if}{#each presets as preset,i}<div class="preset-row"><button onclick={()=>{apply(preset.config);persist();modal='';notify('Workout loaded');}}><strong>{preset.name}</strong><small>{preset.config.rounds} rounds · {fmt(preset.config.work)} work · {fmt(preset.config.rest)} rest</small></button><button class="icon-button" aria-label={`Delete ${preset.name}`} onclick={()=>{presets=presets.filter((_,j)=>i!==j);localStorage.setItem('tempo-presets',JSON.stringify(presets));}}>{@render icon('close',18)}</button></div>{/each}<label class="preset-label" for="preset-name">Save current workout</label><input id="preset-name" class="preset-input" placeholder="e.g. Sunday strength" maxlength="48" bind:value={presetName}/><button class="modal-primary" disabled={!presetName.trim()} onclick={savePreset}>Save workout {@render icon('bookmark',18)}</button>
 {:else if modal==='stop'}<h2>Finish for now?</h2><p>Your workout setup will be here when you're ready.</p><button class="modal-primary" onclick={stop}>End workout</button><button class="text-button" onclick={()=>modal=''}>Keep going</button>{/if}
 </div></div>
